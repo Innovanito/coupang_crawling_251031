@@ -1,0 +1,3 @@
+curl "https://example.com" 
+--proxy brd.superproxy.io:33335 
+--proxy-user brd-customer-<customer_id>-zone-<zone_name>-country-us:<zone_password>
