@@ -1,0 +1,334 @@
+from bs4 import BeautifulSoup
+import requests
+import csv
+import warnings
+import time
+import json
+from urllib.parse import quote
+from datetime import datetime
+import os
+
+# 경고 무시 (urllib3 InsecureRequestWarning 등)
+warnings.filterwarnings(
+    "ignore", category=requests.packages.urllib3.exceptions.InsecureRequestWarning
+)
+
+# Bright Data API 설정 (main.py 스타일 재사용)
+BRD_API_URL = "https://api.brightdata.com/request"
+# 환경변수 우선, 없으면 기존 값 사용
+BRD_API_TOKEN = os.getenv(
+    "BRD_API_TOKEN",
+    "05aef2b4090457d4596657a92e2cab7ce602375b4d5e90ea0cdf8b49781df158",
+)
+BRD_ZONE = os.getenv("BRD_ZONE", "web_unlocker_251031")
+
+
+def fetch_html_via_brightdata(target_url, retries=3, backoff=5):
+    encoded_url = requests.utils.requote_uri(target_url)
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {BRD_API_TOKEN}",
+    }
+    payload = {
+        "zone": BRD_ZONE,
+        "url": encoded_url,
+        "method": "GET",
+        "format": "raw",
+        "country": "kr",
+        "headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.coupang.com/",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    }
+
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.post(
+                BRD_API_URL, headers=headers, data=json.dumps(payload), timeout=60
+            )
+            response.raise_for_status()
+            return response.text
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            print(f"[경고] Bright Data 지연 (시도 {attempt}/{retries}) - {e}")
+            if attempt < retries:
+                time.sleep(backoff * attempt)
+            else:
+                raise
+
+
+def parse_search_results(html):
+    """
+    Coupang 검색결과에서 최대 36개 항목을 확장 파싱
+    반환: [rank, name, original_price, discount_price, final_price, rocket_badge, arrival, free_shipping, review_count, points, stock_status, link, img_url]
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 신 구조 우선
+    items = soup.select("#product-list .ProductUnit_productUnit__Qd6sv")
+    if not items:
+        # 폴백 선택자
+        items = soup.select("[class*=search-product], .baby-product, .search-product-wrap, li[class*=product]")
+
+    results = []
+    for idx, item in enumerate(items, start=1):
+        # 이름
+        name_node = item.select_one(".ProductUnit_productNameV2__cV9cw") or item.select_one(".name")
+
+        # 가격 영역
+        import re
+        price_container = item.select_one(".PriceArea_priceArea__NntJz")
+        original_price = ""
+        discount_price = ""
+        final_price = ""
+        if price_container:
+            # 원가 <del>
+            del_node = price_container.select_one("del")
+            if del_node:
+                m = re.search(r"([0-9][0-9,\.]+)\s*원?", del_node.get_text(" ", strip=True))
+                if m:
+                    original_price = m.group(1) + "원"
+            # 최종가: 컨테이너 전체 텍스트에서 금액 패턴들 추출 후 마지막 항목(보통 최종가)을 사용
+            all_txt = price_container.get_text(" ", strip=True)
+            amounts = re.findall(r"([0-9][0-9,\.]+)\s*원", all_txt)
+            if amounts:
+                final_price = amounts[-1] + "원"
+            # 구 구조 폴백
+            if not final_price:
+                price_node = price_container.select_one(".price-value")
+                if price_node:
+                    m = re.search(r"([0-9][0-9,\.]+)\s*원?", price_node.get_text(" ", strip=True))
+                    if m:
+                        final_price = m.group(1) + "원"
+            # 할인가 = 최종가로 간주
+            discount_price = final_price
+        else:
+            # 구 구조 폴백
+            price_node = item.select_one(".price-value")
+            if price_node:
+                txt = price_node.get_text(" ", strip=True)
+                m = re.search(r"([0-9][0-9,\.]+)\s*원?", txt)
+                if m:
+                    final_price = discount_price = m.group(1) + "원"
+        if not final_price and not discount_price and not original_price:
+            # 가격 전혀 없으면 스킵
+            continue
+
+        # 링크
+        a_tag = item.select_one("a")
+        href = a_tag.get("href") if a_tag else None
+        link = f"https://www.coupang.com{href}" if href and href.startswith("/") else (href or "")
+
+        # 썸네일
+        thumb = item.select_one(".search-product-wrap-img")
+        if thumb and thumb.get("data-img-src"):
+            img_url = f"https:{thumb.get('data-img-src')}"
+        elif thumb and thumb.get("src"):
+            img_url = f"https:{thumb.get('src')}"
+        else:
+            img_url = ""
+        img_url = img_url.replace("230x230ex", "700x700ex")
+
+        # 랭킹
+        rank = ""
+        rank_node = item.select_one("[class*=RankMark_rank]")
+        if rank_node:
+            r = re.search(r"\d+", rank_node.get_text(" ", strip=True))
+            if r:
+                rank = r.group(0)
+        if not rank:
+            # 링크의 rank 파라미터 폴백
+            if href:
+                r = re.search(r"[?&]rank=(\d+)", href)
+                if r:
+                    rank = r.group(1)
+
+        # 로켓 배지 감지 (이미지 src 키워드 기반)
+        rocket_badge = ""
+        badge_imgs = item.select("img")
+        for img in badge_imgs:
+            src = (img.get("src") or "") + (img.get("data-src") or "")
+            if "logo_rocket" in src:
+                rocket_badge = "로켓배송"
+                break
+            if "logoRocketMerchant" in src:
+                rocket_badge = "판매자배송(로켓제휴)"
+                # 계속 탐색해서 로켓이 있으면 로켓으로 덮어쓰기
+            if "rocket-fresh" in src:
+                rocket_badge = "로켓프레시"
+            if "rocket_install" in src:
+                rocket_badge = "로켓설치"
+            if "logo_jikgu" in src:
+                rocket_badge = "로켓직구"
+
+        # 도착일/도착보장
+        arrival = ""
+        arrival_node = item.find(string=re.compile(r"(도착 예정|도착 보장)"))
+        if arrival_node:
+            arrival = arrival_node.strip()
+        else:
+            # 요소 전체 텍스트에서 도착 관련 문구 추출
+            txt = item.get_text(" ", strip=True)
+            m = re.search(r"(내일\(.+?\)\s*도착\s*보장|도착\s*예정|도착\s*보장)", txt)
+            if m:
+                arrival = m.group(0)
+
+        # 무료배송
+        free_shipping = "무료배송" if item.find(string=re.compile(r"무료배송")) else ""
+
+        # 리뷰수
+        review_count = ""
+        rc_node = item.select_one(".ProductRating_ratingCount__R0Vhz")
+        if rc_node:
+            m = re.search(r"\((\d+)\)", rc_node.get_text(" ", strip=True))
+            if m:
+                review_count = m.group(1)
+
+        # 포인트 적립
+        points = ""
+        points_node = item.select_one(".BenefitBadge_cash-benefit__SmkrN")
+        if points_node:
+            pts_txt = points_node.get_text(" ", strip=True)
+            m = re.search(r"([0-9][0-9,\.]+)\s*원\s*적립", pts_txt)
+            if m:
+                points = m.group(1) + "원"
+            else:
+                points = pts_txt
+
+        # 재고/품절 현황
+        stock_status = ""
+        # 예: '품절임박', '일시품절', '일부 옵션 품절' 등 텍스트 탐색
+        status_text = item.get_text(" ", strip=True)
+        if "품절임박" in status_text:
+            stock_status = "품절임박"
+        elif "품절" in status_text:
+            stock_status = "품절"
+
+        name_text = "" if not name_node else name_node.get_text(strip=True)
+        results.append([
+            rank or "",
+            name_text,
+            original_price,
+            discount_price,
+            final_price,
+            rocket_badge,
+            arrival,
+            "Y" if free_shipping else "N",
+            review_count,
+            points,
+            stock_status,
+            link,
+            img_url,
+        ])
+
+        if len(results) >= 36:
+            break
+
+    return results
+
+
+def search_coupang_for_keyword(keyword):
+    encoded_keyword = quote(keyword, safe="")
+    searchProductListSize = 36
+    url = f"https://www.coupang.com/np/search?component=&q={encoded_keyword}&page=1&listSize={searchProductListSize}"
+    html = fetch_html_via_brightdata(url)
+    return parse_search_results(html)
+
+
+def detect_columns(header_row):
+    """
+    header_row에서 '브랜드'가 포함된 컬럼과 '키워드' 컬럼을 추정
+    """
+    brand_idx = None
+    keyword_idx = None
+
+    for i, h in enumerate(header_row):
+        h_norm = (h or "").replace("\n", "").replace("\r", "").strip()
+        if brand_idx is None and "브랜드" in h_norm:
+            brand_idx = i
+        # '키워드'가 정확히 일치하면 우선
+        if h_norm == "키워드":
+            keyword_idx = i
+        elif keyword_idx is None and "키워드" in h_norm:
+            keyword_idx = i
+
+    return brand_idx, keyword_idx
+
+
+def load_keywords_from_csv(input_csv_path, limit=5):
+    keywords = []
+    with open(input_csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return []
+
+        brand_idx, keyword_idx = detect_columns(header)
+        if brand_idx is None or keyword_idx is None:
+            raise ValueError("CSV 헤더에서 '브랜드' 또는 '키워드' 컬럼을 찾지 못했습니다.")
+
+        for row in reader:
+            # 멀티라인 셀을 csv가 알아서 처리하므로 그대로 사용
+            if not row:
+                continue
+            brand_val = (row[brand_idx] if len(row) > brand_idx else "").strip()
+            keyword_val = (row[keyword_idx] if len(row) > keyword_idx else "").strip()
+
+            # 브랜드 값이 'X'인 항목만
+            if brand_val == "X" and keyword_val:
+                keywords.append(keyword_val)
+                if len(keywords) >= limit:
+                    break
+    return keywords
+
+
+def main():
+    input_csv_file = "Discovery_패션소품_20251111214953.csv"
+    input_csv = f'/Users/hakyeongkim/Desktop/Coupang_crawling/{input_csv_file}'
+    output_csv = f"/Users/hakyeongkim/Desktop/Coupang_crawling/{input_csv_file.split('.')[0]}_rocket_results.csv"
+
+    start_time = datetime.now()
+    print(f"시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # 1) 키워드 로드 (브랜드 == 'X', 최대 5개)
+    keywords = load_keywords_from_csv(input_csv, limit=5)
+    print('keywords:', keywords)
+    print(f"키워드({len(keywords)}): {keywords}")
+
+    # 2) 각 키워드별 검색 36개 수집 후 CSV 저장
+    with open(output_csv, "w", encoding="utf-8", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow([
+            "Keyword", "Rank", "Name", "OriginalPrice", "DiscountPrice", "FinalPrice",
+            "RocketBadge", "Arrival", "FreeShipping", "ReviewCount", "Points",
+            "StockStatus", "Link", "ImgUrl"
+        ])
+
+        for kw in keywords:
+            print(f"\n[키워드] {kw} - 검색 시작")
+            try:
+                results = search_coupang_for_keyword(kw)
+            except Exception as e:
+                print(f"[오류] 검색 실패: {kw} - {e}")
+                continue
+
+            for row in results:
+                writer.writerow([kw] + row)
+            csvfile.flush()
+            print(f"[키워드] {kw} - {len(results)}건 기록 완료")
+
+    end_time = datetime.now()
+    print(f"\n종료: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"총 소요: {end_time - start_time}")
+
+
+if __name__ == "__main__":
+    main()
+

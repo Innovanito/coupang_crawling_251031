@@ -324,7 +324,7 @@ with open(
     # 1 페이지만 스크랩
     for page_num in range(1, 2):
         encoded_keyword = quote(keyword, safe="")
-        searchProductListSize = 30
+        searchProductListSize = 36
         url = f"https://www.coupang.com/np/search?component=&q={encoded_keyword}&page={page_num}&listSize={searchProductListSize}"
         if not page_num:
             break
