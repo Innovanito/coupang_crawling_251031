@@ -4,7 +4,7 @@ import csv
 import re
 import os
 
-original_file_name = "Discovery_코트_20251111003804"
+original_file_name = "Discovery_헤어액세서리_20251112214121"
 input_file = f"/Users/hakyeongkim/Desktop/Coupang_crawling/{original_file_name}.xlsx"
 output_file = f"/Users/hakyeongkim/Desktop/Coupang_crawling/{original_file_name}.csv"
 

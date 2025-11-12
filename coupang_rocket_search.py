@@ -7,11 +7,28 @@ import json
 from urllib.parse import quote
 from datetime import datetime
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # 경고 무시 (urllib3 InsecureRequestWarning 등)
 warnings.filterwarnings(
     "ignore", category=requests.packages.urllib3.exceptions.InsecureRequestWarning
 )
+
+# 전역 설정
+BASE_DIR = "/Users/hakyeongkim/Desktop/Coupang_crawling"
+DEFAULT_INPUT_CSV_FILE = "Discovery_헤어액세서리_20251112214121.csv"
+
+# CSV 헤더 정의
+RESULTS_CSV_HEADER = [
+    "키워드", "순위", "상품명", "원가", "최종가격",
+    "로켓배지", "도착일", "무료배송", "리뷰수", "포인트",
+    "재고현황", "링크", "이미지URL"
+]
+
+SUMMARY_CSV_HEADER = [
+    "키워드", "평균최종가격", "로켓배지개수", "평균리뷰수", "상품개수"
+]
 
 # Bright Data API 설정 (main.py 스타일 재사용)
 BRD_API_URL = "https://api.brightdata.com/request"
@@ -164,11 +181,11 @@ def parse_search_results(html):
             src = (img.get("src") or "") + (img.get("data-src") or "")
             if not src:
                 continue
-            # 기존 로직: 단순 키워드 매칭 (순서: 판매자배송 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송)
+            # 기존 로직: 단순 키워드 매칭 (순서: 판매자로켓 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송)
             if "logoRocketMerchant" in src or "badge_199559e56f7" in src:
-                rocket_badge = "판매자배송"
-                print(f"[DEBUG 배지] 기존 로직 → 판매자배송 감지 (src: {src[:100]})")
-                break  # 판매자배송은 우선 처리
+                rocket_badge = "판매자로켓"
+                print(f"[DEBUG 배지] 기존 로직 → 판매자로켓 감지 (src: {src[:100]})")
+                break  # 판매자로켓은 우선 처리
             if "rocket-fresh" in src:
                 rocket_badge = "로켓프레시"
                 print(f"[DEBUG 배지] 기존 로직 → 로켓프레시 감지 (src: {src[:100]})")
@@ -194,10 +211,10 @@ def parse_search_results(html):
                 if badge_img:
                     src = (badge_img.get("src") or "") + (badge_img.get("data-src") or "")
                     print(f"[DEBUG 배지] ImageBadge 발견 - 상품: {name_text[:30]}... src: {src[:100]}")
-                    # 순서: 판매자배송 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송
+                    # 순서: 판매자로켓 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송
                     if "logoRocketMerchant" in src or "RocketMerchant" in src or "badge_199559e56f7" in src:
-                        rocket_badge = "판매자배송"
-                        print(f"[DEBUG 배지] 새 로직 → 판매자배송 감지")
+                        rocket_badge = "판매자로켓"
+                        print(f"[DEBUG 배지] 새 로직 → 판매자로켓 감지")
                     elif "rocket-fresh" in src or "rocket_fresh" in src:
                         rocket_badge = "로켓프레시"
                         print(f"[DEBUG 배지] 새 로직 → 로켓프레시 감지")
@@ -222,11 +239,11 @@ def parse_search_results(html):
                     src = (img.get("src") or "") + (img.get("data-src") or "")
                     if not src:
                         continue
-                    # 우선순위: 판매자배송 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송
+                    # 우선순위: 판매자로켓 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송
                     if "logoRocketMerchant" in src or "RocketMerchant" in src or "badge_199559e56f7" in src:
-                        rocket_badge = "판매자배송"
-                        print(f"[DEBUG 배지] 새 로직 폴백 → 판매자배송 감지 (src: {src[:100]})")
-                        break  # 판매자배송은 우선 처리
+                        rocket_badge = "판매자로켓"
+                        print(f"[DEBUG 배지] 새 로직 폴백 → 판매자로켓 감지 (src: {src[:100]})")
+                        break  # 판매자로켓은 우선 처리
                     elif ("rocket-fresh" in src or "rocket_fresh" in src) and not rocket_badge:
                         rocket_badge = "로켓프레시"
                         print(f"[DEBUG 배지] 새 로직 폴백 → 로켓프레시 감지 (src: {src[:100]})")
@@ -249,15 +266,41 @@ def parse_search_results(html):
 
         # 도착일/도착보장
         arrival = ""
-        arrival_node = item.find(string=re.compile(r"(도착 예정|도착 보장)"))
-        if arrival_node:
-            arrival = arrival_node.strip()
-        else:
-            # 요소 전체 텍스트에서 도착 관련 문구 추출
+        # .fw-leading-[15px] 클래스를 가진 요소에서 도착 정보 추출 (CSS 특수문자 포함 → regex 사용)
+        arrival_containers = item.find_all(
+            lambda tag: tag.has_attr("class")
+            and any(re.search(r"fw-leading-\[15px\]", cls) for cls in tag["class"])
+        )
+        for container in arrival_containers:
+            container_text = container.get_text(" ", strip=True)
+            # "도착 예정" 또는 "도착 보장"이 포함된 경우
+            if "도착 예정" in container_text or "도착 보장" in container_text:
+                arrival = container_text
+                break
+        
+        # 위 방법으로 못 찾으면 기존 방법 시도
+        if not arrival:
+            arrival_node = item.find(string=re.compile(r"(도착 예정|도착 보장)"))
+            if arrival_node:
+                # 부모 요소에서 전체 텍스트 추출 (날짜 포함)
+                parent = arrival_node.parent
+                if parent:
+                    arrival = parent.get_text(" ", strip=True)
+                else:
+                    arrival = arrival_node.strip()
+        
+        # 여전히 못 찾으면 전체 텍스트에서 패턴 검색
+        if not arrival:
             txt = item.get_text(" ", strip=True)
-            m = re.search(r"(내일\(.+?\)\s*도착\s*보장|도착\s*예정|도착\s*보장)", txt)
+            # 다양한 패턴: "12/1 도착 예정", "모레(금) 도착 예정", "내일(목) 도착 보장" 등
+            m = re.search(r"([0-9]{1,2}/[0-9]{1,2}|모레\([^)]+\)|내일\([^)]+\)|[가-힣]+\([^)]+\))\s*도착\s*(예정|보장)", txt)
             if m:
                 arrival = m.group(0)
+            else:
+                # 간단한 패턴
+                m = re.search(r"(도착\s*예정|도착\s*보장)", txt)
+                if m:
+                    arrival = m.group(0)
 
         # 무료배송
         free_shipping = "무료배송" if item.find(string=re.compile(r"무료배송")) else ""
@@ -266,9 +309,23 @@ def parse_search_results(html):
         review_count = ""
         rc_node = item.select_one(".ProductRating_ratingCount__R0Vhz")
         if rc_node:
-            m = re.search(r"\((\d+)\)", rc_node.get_text(" ", strip=True))
+            # HTML 주석이 포함된 경우를 대비해 여러 방법 시도
+            # 방법 1: get_text()로 추출
+            rc_text = rc_node.get_text(" ", strip=True)
+            m = re.search(r"\((\d+)\)", rc_text)
             if m:
                 review_count = m.group(1)
+            else:
+                # 방법 2: HTML 문자열에서 직접 추출 (주석 포함)
+                rc_html = str(rc_node)
+                m = re.search(r"\([^)]*?(\d+)[^)]*?\)", rc_html)
+                if m:
+                    review_count = m.group(1)
+                else:
+                    # 방법 3: 모든 숫자 찾기
+                    all_numbers = re.findall(r"\d+", rc_text)
+                    if all_numbers:
+                        review_count = all_numbers[0]
 
         # 포인트 적립
         points = ""
@@ -316,8 +373,12 @@ def search_coupang_for_keyword(keyword):
     encoded_keyword = quote(keyword, safe="")
     searchProductListSize = 36
     url = f"https://www.coupang.com/np/search?component=&q={encoded_keyword}&page=1&listSize={searchProductListSize}"
-    html = fetch_html_via_brightdata(url)
-    return parse_search_results(html)
+    try:
+        html = fetch_html_via_brightdata(url)
+        return parse_search_results(html)
+    except Exception as e:
+        # Bright Data 실패 시 특별한 예외 발생
+        raise Exception(f"Bright Data API 실패: {str(e)}")
 
 
 def detect_columns(header_row):
@@ -340,7 +401,7 @@ def detect_columns(header_row):
     return brand_idx, keyword_idx
 
 
-def load_keywords_from_csv(input_csv_path, limit=5):
+def load_keywords_from_csv(input_csv_path, limit=None):  # limit=5 주석처리
     keywords = []
     with open(input_csv_path, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
@@ -363,45 +424,127 @@ def load_keywords_from_csv(input_csv_path, limit=5):
             # 브랜드 값이 'X'인 항목만
             if brand_val == "X" and keyword_val:
                 keywords.append(keyword_val)
-                if len(keywords) >= limit:
+                # limit이 None이 아니고 지정된 개수에 도달하면 중단
+                if limit is not None and len(keywords) >= limit:
                     break
     return keywords
 
 
+def process_keyword(kw, writer, sum_writer, csvfile, sumfile, lock):
+    """
+    단일 키워드를 처리하고 CSV에 기록하는 함수 (스레드 안전)
+    """
+    print(f"\n[키워드] {kw} - 검색 시작")
+    # 요청 간 딜레이 1.5초
+    time.sleep(1.5)
+    try:
+        results = search_coupang_for_keyword(kw)
+    except Exception as e:
+        print(f"[오류] 검색 실패: {kw} - {e}")
+        # 에러 정보를 CSV에 기록 (스레드 안전)
+        error_row = [
+            "",  # Rank
+            "데이터를 못 받아 왔습니다",  # Name
+            "",  # OriginalPrice
+            "",  # FinalPrice
+            "",  # RocketBadge
+            "",  # Arrival
+            "",  # FreeShipping
+            "",  # ReviewCount
+            "",  # Points
+            "",  # StockStatus
+            "",  # Link
+            ""   # ImgUrl
+        ]
+        lock.acquire()
+        try:
+            writer.writerow([kw] + error_row)
+            csvfile.flush()
+            # 요약 CSV에도 에러 정보 기록
+            sum_writer.writerow([kw, 0, 0, "0.00", 0])
+            sumfile.flush()
+        finally:
+            lock.release()
+        print(f"[키워드] {kw} - 에러 정보 기록 완료")
+        return
+    
+    # 집계: 평균 최종가, 로켓 배지 개수, 평균 리뷰수
+    def _to_int(num_str: str) -> int:
+        try:
+            import re as _re
+            digits = _re.sub(r"[^\d]", "", num_str or "")
+            return int(digits) if digits else 0
+        except Exception:
+            return 0
+    
+    num_items = len(results)
+    final_prices = [_to_int(r[3]) for r in results]  # row: [Rank, Name, OriginalPrice, FinalPrice, RocketBadge, ...]
+    avg_final_price = int(sum(final_prices) / num_items) if num_items else 0
+    rocket_badge_count = sum(1 for r in results if ("로켓" in (r[4] or "")))
+    review_counts = [_to_int(r[7]) for r in results]
+    avg_review_count = float(sum(review_counts) / num_items) if num_items else 0.0
+    
+    # CSV에 기록 (스레드 안전)
+    lock.acquire()
+    try:
+        for row in results:
+            writer.writerow([kw] + row)
+        csvfile.flush()
+        sum_writer.writerow([kw, avg_final_price, rocket_badge_count, f"{avg_review_count:.2f}", num_items])
+        sumfile.flush()
+    finally:
+        lock.release()
+    
+    print(f"[키워드] {kw} - {len(results)}건 기록 완료")
+
+
+def get_file_paths(input_csv_file):
+    """
+    입력 CSV 파일명으로부터 관련 파일 경로들을 반환
+    """
+    input_csv = f'{BASE_DIR}/{input_csv_file}'
+    base_name = input_csv_file.split('.')[0]
+    output_csv = f"{BASE_DIR}/{base_name}_rocket_results.csv"
+    summary_csv = f"{BASE_DIR}/{base_name}_rocket_result_summary.csv"
+    return input_csv, output_csv, summary_csv
+
+
 def main():
-    input_csv_file = "Discovery_패션소품_20251111214953.csv"
-    input_csv = f'/Users/hakyeongkim/Desktop/Coupang_crawling/{input_csv_file}'
-    output_csv = f"/Users/hakyeongkim/Desktop/Coupang_crawling/{input_csv_file.split('.')[0]}_rocket_results.csv"
+    input_csv_file = DEFAULT_INPUT_CSV_FILE
+    input_csv, output_csv, summary_csv = get_file_paths(input_csv_file)
 
     start_time = datetime.now()
     print(f"시작: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # 1) 키워드 로드 (브랜드 == 'X', 최대 5개)
-    keywords = load_keywords_from_csv(input_csv, limit=5)
+    keywords = load_keywords_from_csv(input_csv)  # limit=5 주석처리
     print('keywords:', keywords)
     print(f"키워드({len(keywords)}): {keywords}")
 
     # 2) 각 키워드별 검색 36개 수집 후 CSV 저장
-    with open(output_csv, "w", encoding="utf-8", newline="") as csvfile:
+    with open(output_csv, "w", encoding="utf-8", newline="") as csvfile, \
+         open(summary_csv, "w", encoding="utf-8", newline="") as sumfile:
         writer = csv.writer(csvfile)
-        writer.writerow([
-            "Keyword", "Rank", "Name", "OriginalPrice", "FinalPrice",
-            "RocketBadge", "Arrival", "FreeShipping", "ReviewCount", "Points",
-            "StockStatus", "Link", "ImgUrl"
-        ])
+        sum_writer = csv.writer(sumfile)
+        writer.writerow(RESULTS_CSV_HEADER)
+        sum_writer.writerow(SUMMARY_CSV_HEADER)
 
-        for kw in keywords:
-            print(f"\n[키워드] {kw} - 검색 시작")
-            try:
-                results = search_coupang_for_keyword(kw)
-            except Exception as e:
-                print(f"[오류] 검색 실패: {kw} - {e}")
-                continue
-
-            for row in results:
-                writer.writerow([kw] + row)
-            csvfile.flush()
-            print(f"[키워드] {kw} - {len(results)}건 기록 완료")
+        # 스레드 안전을 위한 Lock
+        lock = threading.Lock()
+        
+        # 4개의 워커 스레드로 병렬 처리
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for kw in keywords:
+                future = executor.submit(process_keyword, kw, writer, sum_writer, csvfile, sumfile, lock)
+                futures.append(future)
+            
+            # 완료된 작업 확인
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"[오류] 작업 실행 중 예외 발생: {e}")
 
     end_time = datetime.now()
     print(f"\n종료: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -410,4 +553,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
