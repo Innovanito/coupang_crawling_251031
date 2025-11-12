@@ -51,7 +51,7 @@ def fetch_html_via_brightdata(target_url, retries=3, backoff=5):
     for attempt in range(1, retries + 1):
         try:
             response = requests.post(
-                BRD_API_URL, headers=headers, data=json.dumps(payload), timeout=60
+                BRD_API_URL, headers=headers, data=json.dumps(payload), timeout=30
             )
             response.raise_for_status()
             return response.text
@@ -66,7 +66,7 @@ def fetch_html_via_brightdata(target_url, retries=3, backoff=5):
 def parse_search_results(html):
     """
     Coupang 검색결과에서 최대 36개 항목을 확장 파싱
-    반환: [rank, name, original_price, discount_price, final_price, rocket_badge, arrival, free_shipping, review_count, points, stock_status, link, img_url]
+    반환: [rank, name, original_price, final_price, rocket_badge, arrival, free_shipping, review_count, points, stock_status, link, img_url]
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -85,7 +85,6 @@ def parse_search_results(html):
         import re
         price_container = item.select_one(".PriceArea_priceArea__NntJz")
         original_price = ""
-        discount_price = ""
         final_price = ""
         if price_container:
             # 원가 <del>
@@ -106,8 +105,6 @@ def parse_search_results(html):
                     m = re.search(r"([0-9][0-9,\.]+)\s*원?", price_node.get_text(" ", strip=True))
                     if m:
                         final_price = m.group(1) + "원"
-            # 할인가 = 최종가로 간주
-            discount_price = final_price
         else:
             # 구 구조 폴백
             price_node = item.select_one(".price-value")
@@ -115,8 +112,8 @@ def parse_search_results(html):
                 txt = price_node.get_text(" ", strip=True)
                 m = re.search(r"([0-9][0-9,\.]+)\s*원?", txt)
                 if m:
-                    final_price = discount_price = m.group(1) + "원"
-        if not final_price and not discount_price and not original_price:
+                    final_price = m.group(1) + "원"
+        if not final_price and not original_price:
             # 가격 전혀 없으면 스킵
             continue
 
@@ -149,23 +146,106 @@ def parse_search_results(html):
                 if r:
                     rank = r.group(1)
 
-        # 로켓 배지 감지 (이미지 src 키워드 기반)
+        # 로켓 배지 감지 (기존 로직 + 새 로직 병행)
         rocket_badge = ""
-        badge_imgs = item.select("img")
-        for img in badge_imgs:
+        name_text = "" if not name_node else name_node.get_text(strip=True)
+        
+        # 모든 img 태그 수집
+        all_imgs = item.select("img")
+        debug_srcs = []
+        for img in all_imgs:
+            src_val = img.get("src") or img.get("data-src") or ""
+            if src_val:
+                debug_srcs.append(src_val)
+        
+        # ===== 기존 로직 (단순 img 태그 검색) =====
+        print(f"[DEBUG 배지] 기존 로직 시작 - 상품: {name_text[:30]}... (img 개수: {len(all_imgs)})")
+        for img in all_imgs:
             src = (img.get("src") or "") + (img.get("data-src") or "")
-            if "logo_rocket" in src:
-                rocket_badge = "로켓배송"
-                break
-            if "logoRocketMerchant" in src:
-                rocket_badge = "판매자배송(로켓제휴)"
-                # 계속 탐색해서 로켓이 있으면 로켓으로 덮어쓰기
+            if not src:
+                continue
+            # 기존 로직: 단순 키워드 매칭 (순서: 판매자배송 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송)
+            if "logoRocketMerchant" in src or "badge_199559e56f7" in src:
+                rocket_badge = "판매자배송"
+                print(f"[DEBUG 배지] 기존 로직 → 판매자배송 감지 (src: {src[:100]})")
+                break  # 판매자배송은 우선 처리
             if "rocket-fresh" in src:
                 rocket_badge = "로켓프레시"
+                print(f"[DEBUG 배지] 기존 로직 → 로켓프레시 감지 (src: {src[:100]})")
             if "rocket_install" in src:
                 rocket_badge = "로켓설치"
+                print(f"[DEBUG 배지] 기존 로직 → 로켓설치 감지 (src: {src[:100]})")
             if "logo_jikgu" in src:
                 rocket_badge = "로켓직구"
+                print(f"[DEBUG 배지] 기존 로직 → 로켓직구 감지 (src: {src[:100]})")
+            # 로켓배송은 마지막에 체크 (다른 배지가 없을 때만, badge_199559e56f7 제외)
+            if not rocket_badge and ("logo_rocket" in src or ("delivery_badge_ext" in src and "badge_199559e56f7" not in src) or ("badge_" in src and "badge_199559e56f7" not in src)):
+                rocket_badge = "로켓배송"
+                print(f"[DEBUG 배지] 기존 로직 → 로켓배송 감지 (src: {src[:100]})")
+                break
+        
+        # ===== 새 로직 (ImageBadge 컨테이너 기반) =====
+        if not rocket_badge:
+            print(f"[DEBUG 배지] 새 로직 시작 - 상품: {name_text[:30]}...")
+            # 우선 ImageBadge 영역에서 찾기
+            badge_container = item.select_one(".ImageBadge_default__JWaYp")
+            if badge_container:
+                badge_img = badge_container.select_one("img")
+                if badge_img:
+                    src = (badge_img.get("src") or "") + (badge_img.get("data-src") or "")
+                    print(f"[DEBUG 배지] ImageBadge 발견 - 상품: {name_text[:30]}... src: {src[:100]}")
+                    # 순서: 판매자배송 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송
+                    if "logoRocketMerchant" in src or "RocketMerchant" in src or "badge_199559e56f7" in src:
+                        rocket_badge = "판매자배송"
+                        print(f"[DEBUG 배지] 새 로직 → 판매자배송 감지")
+                    elif "rocket-fresh" in src or "rocket_fresh" in src:
+                        rocket_badge = "로켓프레시"
+                        print(f"[DEBUG 배지] 새 로직 → 로켓프레시 감지")
+                    elif "rocket_install" in src or "rocket-install" in src:
+                        rocket_badge = "로켓설치"
+                        print(f"[DEBUG 배지] 새 로직 → 로켓설치 감지")
+                    elif "logo_jikgu" in src or "jikgu" in src:
+                        rocket_badge = "로켓직구"
+                        print(f"[DEBUG 배지] 새 로직 → 로켓직구 감지")
+                    elif "logo_rocket" in src or "logo_rocket_large" in src or ("delivery_badge_ext" in src and "badge_199559e56f7" not in src) or ("badge_" in src and "badge_199559e56f7" not in src):
+                        rocket_badge = "로켓배송"
+                        print(f"[DEBUG 배지] 새 로직 → 로켓배송 감지")
+                    else:
+                        print(f"[DEBUG 배지] 새 로직 → 배지 타입 미확인 (src: {src[:100]})")
+            else:
+                print(f"[DEBUG 배지] ImageBadge 컨테이너 없음 - 상품: {name_text[:30]}...")
+            
+            # ImageBadge에서 못 찾으면 전체 img 태그에서 검색 (폴백)
+            if not rocket_badge:
+                print(f"[DEBUG 배지] 새 로직 폴백 검색 시작 - 상품: {name_text[:30]}... (img 개수: {len(all_imgs)})")
+                for img in all_imgs:
+                    src = (img.get("src") or "") + (img.get("data-src") or "")
+                    if not src:
+                        continue
+                    # 우선순위: 판매자배송 > 로켓프레시 > 로켓설치 > 로켓직구 > 로켓배송
+                    if "logoRocketMerchant" in src or "RocketMerchant" in src or "badge_199559e56f7" in src:
+                        rocket_badge = "판매자배송"
+                        print(f"[DEBUG 배지] 새 로직 폴백 → 판매자배송 감지 (src: {src[:100]})")
+                        break  # 판매자배송은 우선 처리
+                    elif ("rocket-fresh" in src or "rocket_fresh" in src) and not rocket_badge:
+                        rocket_badge = "로켓프레시"
+                        print(f"[DEBUG 배지] 새 로직 폴백 → 로켓프레시 감지 (src: {src[:100]})")
+                    elif ("rocket_install" in src or "rocket-install" in src) and not rocket_badge:
+                        rocket_badge = "로켓설치"
+                        print(f"[DEBUG 배지] 새 로직 폴백 → 로켓설치 감지 (src: {src[:100]})")
+                    elif ("logo_jikgu" in src or "jikgu" in src) and not rocket_badge:
+                        rocket_badge = "로켓직구"
+                        print(f"[DEBUG 배지] 새 로직 폴백 → 로켓직구 감지 (src: {src[:100]})")
+                    # 로켓배송은 마지막에 체크 (다른 배지가 없을 때만, badge_199559e56f7 제외)
+                    elif not rocket_badge and ("logo_rocket" in src or "logo_rocket_large" in src or ("delivery_badge_ext" in src and "badge_199559e56f7" not in src) or ("badge_" in src and "badge_199559e56f7" not in src)):
+                        rocket_badge = "로켓배송"
+                        print(f"[DEBUG 배지] 새 로직 폴백 → 로켓배송 감지 (src: {src[:100]})")
+                        break
+        
+        if not rocket_badge:
+            print(f"[DEBUG 배지] 배지 없음 - 상품: {name_text[:30]}... (전체 img src: {debug_srcs[:3]})")
+        else:
+            print(f"[DEBUG 배지] 최종 배지: {rocket_badge} - 상품: {name_text[:30]}...")
 
         # 도착일/도착보장
         arrival = ""
@@ -215,7 +295,6 @@ def parse_search_results(html):
             rank or "",
             name_text,
             original_price,
-            discount_price,
             final_price,
             rocket_badge,
             arrival,
@@ -306,7 +385,7 @@ def main():
     with open(output_csv, "w", encoding="utf-8", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
-            "Keyword", "Rank", "Name", "OriginalPrice", "DiscountPrice", "FinalPrice",
+            "Keyword", "Rank", "Name", "OriginalPrice", "FinalPrice",
             "RocketBadge", "Arrival", "FreeShipping", "ReviewCount", "Points",
             "StockStatus", "Link", "ImgUrl"
         ])
