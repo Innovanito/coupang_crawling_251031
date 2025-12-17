@@ -4,6 +4,7 @@ import csv
 import warnings
 import time
 import json
+import random
 from urllib.parse import quote
 from datetime import datetime
 import os
@@ -16,8 +17,8 @@ warnings.filterwarnings(
 )
 
 # 전역 설정
+DEFAULT_INPUT_CSV_FILE = "Discovery_DIY자재_용품_20251115235250.csv"
 BASE_DIR = "/Users/hakyeongkim/Desktop/Coupang_crawling"
-DEFAULT_INPUT_CSV_FILE = "Discovery_헤어액세서리_20251112214121.csv"
 
 # CSV 헤더 정의
 RESULTS_CSV_HEADER = [
@@ -435,8 +436,9 @@ def process_keyword(kw, writer, sum_writer, csvfile, sumfile, lock):
     단일 키워드를 처리하고 CSV에 기록하는 함수 (스레드 안전)
     """
     print(f"\n[키워드] {kw} - 검색 시작")
-    # 요청 간 딜레이 1.5초
-    time.sleep(1.5)
+    # 요청 간 딜레이 1~2초 랜덤
+    delay = random.uniform(1.0, 2.0)
+    time.sleep(delay)
     try:
         results = search_coupang_for_keyword(kw)
     except Exception as e:
@@ -549,6 +551,158 @@ def main():
     end_time = datetime.now()
     print(f"\n종료: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"총 소요: {end_time - start_time}")
+    
+    # 3) 결과값이 0인 키워드 재요청 및 업데이트
+    retry_failed_keywords(output_csv, summary_csv)
+
+
+def retry_failed_keywords(output_csv, summary_csv):
+    """
+    summary CSV에서 상품개수가 0인 키워드를 찾아 재요청하고, 성공 시 두 파일을 업데이트
+    """
+    if not os.path.exists(summary_csv):
+        print("[재요청] summary CSV 파일이 없습니다.")
+        return
+    
+    print("\n" + "="*60)
+    print("[재요청] 결과값이 0인 키워드 확인 및 재요청 시작")
+    print("="*60)
+    
+    # summary CSV에서 상품개수가 0인 키워드 찾기
+    failed_keywords = []
+    try:
+        with open(summary_csv, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)  # 헤더 스킵
+                # 상품개수 컬럼 인덱스 찾기 (마지막 컬럼)
+                num_items_idx = len(header) - 1
+                for row in reader:
+                    if row and len(row) > num_items_idx:
+                        keyword = row[0]
+                        num_items = row[num_items_idx] if num_items_idx < len(row) else "0"
+                        try:
+                            if int(num_items) == 0:
+                                failed_keywords.append(keyword)
+                        except ValueError:
+                            pass
+            except StopIteration:
+                pass
+    except Exception as e:
+        print(f"[재요청] summary CSV 읽기 오류: {e}")
+        return
+    
+    if not failed_keywords:
+        print("[재요청] 재요청할 키워드가 없습니다.")
+        return
+    
+    print(f"[재요청] 재요청할 키워드({len(failed_keywords)}개): {failed_keywords}")
+    
+    # 재요청 및 결과 수집
+    retry_results = {}  # {keyword: (results, summary_data)}
+    
+    for kw in failed_keywords:
+        print(f"\n[재요청] {kw} - 재검색 시작")
+        delay = random.uniform(1.0, 2.0)
+        time.sleep(delay)
+        try:
+            results = search_coupang_for_keyword(kw)
+            if results and len(results) > 0:
+                # 집계 계산
+                def _to_int(num_str: str) -> int:
+                    try:
+                        import re as _re
+                        digits = _re.sub(r"[^\d]", "", num_str or "")
+                        return int(digits) if digits else 0
+                    except Exception:
+                        return 0
+                
+                num_items = len(results)
+                final_prices = [_to_int(r[3]) for r in results]
+                avg_final_price = int(sum(final_prices) / num_items) if num_items else 0
+                rocket_badge_count = sum(1 for r in results if ("로켓" in (r[4] or "")))
+                review_counts = [_to_int(r[7]) for r in results]
+                avg_review_count = float(sum(review_counts) / num_items) if num_items else 0.0
+                
+                summary_data = [kw, avg_final_price, rocket_badge_count, f"{avg_review_count:.2f}", num_items]
+                retry_results[kw] = (results, summary_data)
+                print(f"[재요청] {kw} - 성공 ({num_items}개 상품)")
+            else:
+                print(f"[재요청] {kw} - 결과 없음")
+        except Exception as e:
+            print(f"[재요청] {kw} - 재요청 실패: {e}")
+    
+    if not retry_results:
+        print("[재요청] 성공적으로 재요청된 키워드가 없습니다.")
+        return
+    
+    print(f"\n[재요청] 성공한 키워드({len(retry_results)}개): {list(retry_results.keys())}")
+    
+    # CSV 파일 업데이트: 해당 키워드의 행을 삭제하고 새로 추가
+    update_csv_files(output_csv, summary_csv, retry_results)
+    print("[재요청] CSV 파일 업데이트 완료")
+
+
+def update_csv_files(output_csv, summary_csv, retry_results):
+    """
+    CSV 파일에서 특정 키워드의 행을 삭제하고 새로운 데이터로 교체
+    """
+    # 1) results CSV 업데이트
+    if os.path.exists(output_csv):
+        temp_results = []
+        try:
+            with open(output_csv, "r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader)  # 헤더 저장
+                temp_results.append(header)
+                
+                # 재요청된 키워드가 아닌 행만 유지
+                for row in reader:
+                    if row and len(row) > 0:
+                        keyword = row[0]
+                        if keyword not in retry_results:
+                            temp_results.append(row)
+            
+            # 재요청 성공한 키워드의 새 데이터 추가
+            for kw, (results, _) in retry_results.items():
+                for row in results:
+                    temp_results.append([kw] + row)
+            
+            # 파일 다시 쓰기
+            with open(output_csv, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(temp_results)
+            print(f"[재요청] results CSV 업데이트 완료: {len(retry_results)}개 키워드 교체")
+        except Exception as e:
+            print(f"[재요청] results CSV 업데이트 오류: {e}")
+    
+    # 2) summary CSV 업데이트
+    if os.path.exists(summary_csv):
+        temp_summary = []
+        try:
+            with open(summary_csv, "r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader)  # 헤더 저장
+                temp_summary.append(header)
+                
+                # 재요청된 키워드가 아닌 행만 유지
+                for row in reader:
+                    if row and len(row) > 0:
+                        keyword = row[0]
+                        if keyword not in retry_results:
+                            temp_summary.append(row)
+            
+            # 재요청 성공한 키워드의 새 summary 데이터 추가
+            for kw, (_, summary_data) in retry_results.items():
+                temp_summary.append(summary_data)
+            
+            # 파일 다시 쓰기
+            with open(summary_csv, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(temp_summary)
+            print(f"[재요청] summary CSV 업데이트 완료: {len(retry_results)}개 키워드 교체")
+        except Exception as e:
+            print(f"[재요청] summary CSV 업데이트 오류: {e}")
 
 
 if __name__ == "__main__":
